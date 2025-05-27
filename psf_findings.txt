@@ -1,0 +1,31 @@
+﻿PSF Findings :
+
+
+    • MAE does not work as well as MSE
+    • MSE works well with and without weights. Add weight good thing ?
+    • PSF tiling works well with the base version of Unet. 
+    • Batch Norm is slowing learning 
+    • PSF tiling artifacts show when using 
+a. Dropout 
+b. Multi level fusion in Unet 
+c. Attention networks 
+
+    • More efficient ways of PSF fusion ? Injection at U-Net bottleneck works. But whats the best way ? Why it works ?
+    • Consistency check i.e. Blur(Predicted) = Original Blurred image . But self referencing and prone to collapse. 
+
+
+Current state of the Art :
+
+    • Wiener deconv (Tickon… ) and then denoising with ML . Huh ? 
+
+Ideas to try:
+
+    • Key is how to best incorporate PSF . PSF can be very weird at times. Incorporation needs to be robust ? 
+    • How do normal deblurs work so well without blur kernel ? DeblurGan , Unet deblur etc? Is it also possible in astronomy ? If yes, would it hinder “interesting” object detection because these learn about the world ?
+    • Use a block input form ALL different Psf correction methods such as Rich-Lucy , Wiener etc to Unet. It can do the rest ?
+
+
+ 
+
+
+Simulate Using PhoSim → Sextract sources → Use sextractor map to give base+ block weight → Train
