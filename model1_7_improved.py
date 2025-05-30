@@ -116,49 +116,131 @@ val_wt = tf.convert_to_tensor(val_wt, dtype=tf.float32)
      
 # --- Utility Layers ---
 @register_keras_serializable()
-def compute_ellipticity(image, weight):
+def compute_ellipticity_batched_tf(images, counter_target=100, convergence_threshold=1e-3):
     """
-    image, weight: (batch, H, W, 1)
-    Use provided weight map as-is (no masking).
+    Compute e1, e2 ellipticities from a batch of images using iterative moment matching with adaptive Gaussian weighting.
+    Args:
+        images: Tensor of shape [B, H, W], batch of images.
+        counter_target: Maximum number of iterations (default: 100)
+        convergence_threshold: Threshold for convergence check (default: 1e-6)
+    Returns:
+        e1: Tensor of shape [B], ellipticity component 1
+        e2: Tensor of shape [B], ellipticity component 2
     """
-    eps = 0.1
-    img = tf.squeeze(image, axis=-1)       # (batch, H, W)
-    wt  = tf.squeeze(weight, axis=-1)      # (batch, H, W)
-    I   = img * wt
+    B, H, W = tf.unstack(tf.shape(images))
+    y = tf.linspace(0.0, tf.cast(H - 1, tf.float32), H) - tf.cast(H, tf.float32) / 2.0 + 0.5
+    x = tf.linspace(0.0, tf.cast(W - 1, tf.float32), W) - tf.cast(W, tf.float32) / 2.0 + 0.5
+    Y, X = tf.meshgrid(y, x, indexing='ij')  # [H, W]
+    X = tf.expand_dims(X, 0)  # [1, H, W]
+    Y = tf.expand_dims(Y, 0)  # [1, H, W]
 
-    B = tf.shape(img)[0]
-    H = tf.shape(img)[1]
-    W = tf.shape(img)[2]
+    # Initial guesses
+    alphax = tf.ones([B]) * 3.0
+    alphay = tf.ones([B]) * 3.0
+    alphaxy = tf.zeros([B])
+    mux = tf.zeros([B])
+    muy = tf.zeros([B])
+    back = tf.zeros_like(images[:, 0, 0])
+    prev_sigxx = tf.ones([B]) * 9999.0
+    prev_sigyy = tf.ones([B]) * 9999.0
+    curr_sigxx = tf.zeros([B])
+    curr_sigyy = tf.zeros([B])
 
-    y = tf.cast(tf.range(H), tf.float32) - 47.5
-    x = tf.cast(tf.range(W), tf.float32) - 47.5
-    X, Y = tf.meshgrid(x, y)               # (H, W)
-    X = tf.reshape(X, (1, H, W))
-    Y = tf.reshape(Y, (1, H, W))
-    X = tf.tile(X, [B, 1, 1])
-    Y = tf.tile(Y, [B, 1, 1])
+    def cond(i, alphax, alphay, alphaxy, mux, muy, prev_sigxx, prev_sigyy, curr_sigxx, curr_sigyy, back, e1, e2):
+        # Always run at least one iteration
+        if_first_iter = tf.equal(i, 0)
+        # Check if we've reached max iterations
+        max_iter_reached = tf.less(i, counter_target)
+        # Check convergence by comparing current and previous sigxx/sigyy values
+        sigxx_converged = tf.less(tf.reduce_max(tf.abs(curr_sigxx - prev_sigxx)), convergence_threshold)
+        sigyy_converged = tf.less(tf.reduce_max(tf.abs(curr_sigyy - prev_sigyy)), convergence_threshold)
+        converged = tf.logical_and(sigxx_converged, sigyy_converged)
+        # Don't check convergence on first iteration (prev values are initialization values)
+        converged = tf.logical_and(converged, tf.logical_not(if_first_iter))
+        # Continue if: (not reached max iterations) AND (first iteration OR not converged)
+        return tf.logical_and(max_iter_reached, tf.logical_or(if_first_iter, tf.logical_not(converged)))
+
+    def body(i, alphax, alphay, alphaxy, mux, muy, prev_sigxx, prev_sigyy, curr_sigxx, curr_sigyy, back, e1, e2):
+        Xc = X - tf.reshape(mux, [-1, 1, 1])
+        Yc = Y - tf.reshape(muy, [-1, 1, 1])
+        # Prevent numerical instability in arb_const calculation
+        alpha_ratio = alphaxy / (alphax * alphay + 1e-10)  # Prevent division by zero
+        alpha_ratio = tf.clip_by_value(alpha_ratio, -0.99, 0.99)
+        arb_const = 2.0 * (1.0 - alpha_ratio**2)
+        arb_const = tf.maximum(arb_const, 1e-10)  # Prevent division by zero
+        A = 1.0 / (2.0 * tf.constant(np.pi) * alphax * alphay * tf.sqrt(1.0 - alpha_ratio**2))
+        exp_term = (
+            (Xc**2) / (tf.reshape(arb_const * alphax**2, [-1, 1, 1])) +
+            (Yc**2) / (tf.reshape(arb_const * alphay**2, [-1, 1, 1])) -
+            2 * tf.reshape(alphaxy, [-1, 1, 1]) * Xc * Yc /
+            tf.reshape(arb_const * alphax**2 * alphay**2, [-1, 1, 1])
+        )
+        k = tf.reshape(A, [-1, 1, 1]) * tf.exp(-tf.clip_by_value(exp_term, 0.0, 50.0))
+        img1 = images - tf.reshape(back, [-1, 1, 1])
+        t1 = tf.reduce_sum(X * Y * img1 * k, axis=[1, 2])
+        t2 = tf.reduce_sum(img1 * k, axis=[1, 2])
+        t3 = tf.reduce_sum(X * img1 * k, axis=[1, 2])
+        t4 = tf.reduce_sum(Y * img1 * k, axis=[1, 2])
+        t5 = tf.reduce_sum(X * X * img1 * k, axis=[1, 2])
+        t6 = tf.reduce_sum(Y * Y * img1 * k, axis=[1, 2])
+
+        # Adaptive background estimation
+        t7 = tf.reduce_sum(k * k, axis=[1, 2])          # Denominator
+        flux_calc = t2 / (t7 + 1e-10)                   # Flux under Gaussian PSF
+        total = tf.reduce_sum(images, axis=[1, 2])      # Total image flux
+        image_area = tf.cast(H * W, tf.float32)         # Constant
+        new_back = (total - flux_calc) / image_area     # Estimated background
+        # Prevent division by zero in moment calculations
+        t2_safe = tf.maximum(t2, 1e-10)
+        new_mux = t3 / t2_safe
+        new_muy = t4 / t2_safe
+        sigxx = t5 / t2_safe - (t3 / t2_safe)**2
+        sigyy = t6 / t2_safe - (t4 / t2_safe)**2
+        sigxy = t1 / t2_safe - (t3 * t4) / (t2_safe * t2_safe)
+        #print (sigxx)
+        # Update alpha values with bounds checking
+        new_alphax = tf.sqrt(tf.clip_by_value(sigxx * 2.0, 0.81, 100.0))
+        new_alphay = tf.sqrt(tf.clip_by_value(sigyy * 2.0, 0.81, 100.0))
+        new_alphaxy = 2.0 * sigxy
+        #print (new_alphax)
+        # Compute ellipticities with numerical stability
+        denominator = sigxx + sigyy + 1e-10  # Prevent division by zero
+        new_e1 = (sigxx - sigyy) / denominator
+        new_e2 = 2.0 * sigxy / denominator
+        # Clip ellipticities to reasonable bounds
+        new_e1 = tf.clip_by_value(new_e1, -0.99, 0.99)
+        new_e2 = tf.clip_by_value(new_e2, -0.99, 0.99)
+
+        # Return as list to match loop_vars structure
+        # Move current sigxx/sigyy to prev for next iteration, update current with new values
+        return [i + 1, new_alphax, new_alphay, new_alphaxy, new_mux, new_muy,
+                curr_sigxx, curr_sigyy, sigxx, sigyy, new_back, new_e1, new_e2]
+
+    # Initialize loop variables
+    i = tf.constant(0)
+    e1 = tf.zeros([B])
+    e2 = tf.zeros([B])
+
+    # Run the iterative loop with proper convergence checking
+    # Use list structure for loop_vars to match body function return
+    loop_result = tf.while_loop(
+        cond,
+        body,
+        loop_vars=[i, alphax, alphay, alphaxy, mux, muy, prev_sigxx, prev_sigyy, curr_sigxx, curr_sigyy, back, e1, e2],
+        maximum_iterations=counter_target,
+        parallel_iterations=1  # Ensure sequential execution for convergence
+    )
+
+    # Extract e1 and e2 from the result
+    e1 = loop_result[11]
+    e2 = loop_result[12]
     
-    # Compute the required terms
-    t1 = tf.reduce_sum(X * Y * I, axis=[1, 2])
-    t2 = tf.reduce_sum(I, axis=[1, 2]) + eps
-    t3 = tf.reduce_sum(X * I, axis=[1, 2])
-    t4 = tf.reduce_sum(Y * I, axis=[1, 2])
-    t5 = tf.reduce_sum(X * X * I, axis=[1, 2])
-    t6 = tf.reduce_sum(Y * Y * I, axis=[1, 2])
+    e1 = tf.where(tf.math.is_nan(e1), 0.0, e1)
+    e2 = tf.where(tf.math.is_nan(e2), 0.0, e2)
 
-   
-    # Compute second moments
-    Qxy = (t1 / t2) - (t3 * t4) / (t2 * t2)
-    Qxx = (t5 / t2) - (t3 * t3) / (t2 * t2)
-    Qyy = (t6 / t2) - (t4 * t4) / (t2 * t2)
 
-    # Compute ellipticity
-    denom = Qxx + Qyy + eps
-    e1 = (Qxx - Qyy) / denom
-    e2 = 2.0 * Qxy / denom
-
-  
     return e1, e2
+
 
 @register_keras_serializable()
 def blur_with_kernel(image, kernel):
@@ -182,25 +264,6 @@ def blur_with_kernel(image, kernel):
     blurred_batch = tf.map_fn(single_convolve, (image, kernel), dtype=tf.float32)
     return blurred_batch
 
-
-@register_keras_serializable()
-def ellipticity_loss(y_true, y_pred, weight, clip_threshold=0.9):
-    e1_true, e2_true = compute_ellipticity(y_true, weight)
-    e1_pred, e2_pred = compute_ellipticity(y_pred, weight)
-    diff_e1 = tf.clip_by_value(e1_true - e1_pred, -clip_threshold, clip_threshold)
-    diff_e2 = tf.clip_by_value(e2_true - e2_pred, -clip_threshold, clip_threshold)
-    return tf.reduce_mean(diff_e1**2 + diff_e2**2)
-
-
-
-@register_keras_serializable()
-# Tile PSF spatially and crop to match image dimensions (96×96) for early fusion
-def tile_and_crop_kernel(x):
-    # x: (batch,20,20,1) -> tile 5×5 -> (batch,100,100,1) -> crop center 96×96
-    # tile 5x5 to cover at least 96 pixels
-    t = tf.tile(x, [1, 5, 5, 1])           # (batch,100,100,1)
-    # center-crop to 96x96
-    return t[:, 2:2+96, 2:2+96, :]
 
 
 # --- U-Net Blocks ---
@@ -279,6 +342,11 @@ output = Conv2D(1, 1, padding='same', activation='linear', name='output')(c8)
 # --- Custom Model for Weighted Loss ---
 @register_keras_serializable()
 class WeightedLossModel(Model):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_epoch = tf.Variable(0, trainable=False, dtype=tf.int32)
+
+
     def train_step(self, data):
         (x, y_true) = data
         blurred_img, kernel_img, weight_map = x
@@ -287,12 +355,21 @@ class WeightedLossModel(Model):
             y_pred = self([blurred_img, kernel_img, weight_map], training=True)
 
             weighted_mse = tf.reduce_mean(tf.square(y_pred - y_true)* (weight_map) )
-            ellip_loss = ellipticity_loss(y_true, y_pred, weight_map)
-            #reblurred = blur_with_kernel(y_pred, kernel_img)
+           # Remove channels for ellipticity calculation
+            sharp_true = tf.squeeze(y_true, axis=-1)  # shape [B, H, W]
+            sharp_pred = tf.squeeze(y_pred, axis=-1)
+            
+            # Compute ellipticities
+            e1_true, e2_true = compute_ellipticity_batched_tf(sharp_true)
+            e1_pred, e2_pred = compute_ellipticity_batched_tf(sharp_pred)
+            
+            # Ellipticity loss (L2)
+            ellip_loss = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
+            ellip_weight = tf.constant(0.0, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)            #reblurred = blur_with_kernel(y_pred, kernel_img)
             _, _, reblurred = normalize_all_by_blurred(blurred_img, y_pred, blur_with_kernel(y_pred, kernel_img))
             reblur_loss = tf.reduce_mean(tf.square(reblurred - blurred_img)* (weight_map))
 
-            total_loss = 100*weighted_mse + 10*reblur_loss  
+            total_loss = 100*weighted_mse + 10*reblur_loss 
 
         grads = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
@@ -305,8 +382,17 @@ class WeightedLossModel(Model):
         y_pred = self([blurred_img, kernel_img, weight_map], training=False)
 
         weighted_mse = tf.reduce_mean(tf.square(y_pred - y_true)* (weight_map) )
-        ellip_loss = ellipticity_loss(y_true, y_pred, weight_map)
-        #reblurred = blur_with_kernel(y_pred, kernel_img)
+        # Remove channels for ellipticity calculation
+        sharp_true = tf.squeeze(y_true, axis=-1)  # shape [B, H, W]
+        sharp_pred = tf.squeeze(y_pred, axis=-1)
+        
+        # Compute ellipticities
+        e1_true, e2_true = compute_ellipticity_batched_tf(sharp_true)
+        e1_pred, e2_pred = compute_ellipticity_batched_tf(sharp_pred)
+        
+        # Ellipticity loss (L2)
+        ellip_loss = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
+        ellip_weight = tf.constant(0.0, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)        #reblurred = blur_with_kernel(y_pred, kernel_img)
         _, _, reblurred = normalize_all_by_blurred(blurred_img, y_pred, blur_with_kernel(y_pred, kernel_img))
         reblur_loss = tf.reduce_mean(tf.square(reblurred - blurred_img)* (weight_map))
         
@@ -328,18 +414,23 @@ def lr_schedule(epoch, lr):
 
 lr_scheduler = LearningRateScheduler(lr_schedule, verbose=1)
 
+class EpochTracker(tf.keras.callbacks.Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        self.model.current_epoch.assign(epoch)
+
+
 history = model.fit(
     x=[train_blur, train_ker, train_wt],
     y=train_sharp,
     validation_data=([val_blur, val_ker, val_wt], val_sharp),
-    epochs=20,
+    epochs=10,
     batch_size=256,
     verbose = 1,
-    callbacks=[lr_scheduler]
+    callbacks= [lr_scheduler, EpochTracker()]
 )
 
 # Save model
-model.save('/scratch/bell/dutta26/psf_datasets/unet_psf_model_bottleNeckFusion1_consistency.keras')
+model.save('/scratch/bell/dutta26/psf_datasets/unet_psf_model_bottleNeckFusion_consistency3.keras')
 
 
 import matplotlib.pyplot as plt
@@ -359,5 +450,5 @@ plt.grid(True)
 plt.legend()
 
 # Save the plot
-plt.savefig('/scratch/bell/dutta26/psf_datasets/unet_psf_model_bottleNeckFusion_loss_plot_consistency.png')
+plt.savefig('/scratch/bell/dutta26/psf_datasets/unet_psf_model_bottleNeckFusion_loss_plot_consistency3.png')
 plt.close() 
