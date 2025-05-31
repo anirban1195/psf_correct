@@ -127,92 +127,139 @@ def compute_ellipticity_batched_tf(images, counter_target=100, convergence_thres
         e1: Tensor of shape [B], ellipticity component 1
         e2: Tensor of shape [B], ellipticity component 2
     """
+    """
+    More robust version with extensive NaN prevention
+    """
     B, H, W = tf.unstack(tf.shape(images))
     y = tf.linspace(0.0, tf.cast(H - 1, tf.float32), H) - tf.cast(H, tf.float32) / 2.0 + 0.5
     x = tf.linspace(0.0, tf.cast(W - 1, tf.float32), W) - tf.cast(W, tf.float32) / 2.0 + 0.5
-    Y, X = tf.meshgrid(y, x, indexing='ij')  # [H, W]
-    X = tf.expand_dims(X, 0)  # [1, H, W]
-    Y = tf.expand_dims(Y, 0)  # [1, H, W]
+    Y, X = tf.meshgrid(y, x, indexing='ij')
+    X = tf.expand_dims(X, 0)
+    Y = tf.expand_dims(Y, 0)
 
-    # Initial guesses
-    alphax = tf.ones([B]) * 3.0
-    alphay = tf.ones([B]) * 3.0
+    # More conservative initial conditions
+    alphax = tf.ones([B]) * 2.0
+    alphay = tf.ones([B]) * 2.0
     alphaxy = tf.zeros([B])
     mux = tf.zeros([B])
     muy = tf.zeros([B])
     back = tf.zeros_like(images[:, 0, 0])
-    prev_sigxx = tf.ones([B]) * 9999.0
-    prev_sigyy = tf.ones([B]) * 9999.0
+
+    # Initialize with reasonable values
+    prev_sigxx = tf.ones([B]) * 4.0  # Instead of 9999
+    prev_sigyy = tf.ones([B]) * 4.0
     curr_sigxx = tf.zeros([B])
     curr_sigyy = tf.zeros([B])
 
     def cond(i, alphax, alphay, alphaxy, mux, muy, prev_sigxx, prev_sigyy, curr_sigxx, curr_sigyy, back, e1, e2):
-        # Always run at least one iteration
         if_first_iter = tf.equal(i, 0)
-        # Check if we've reached max iterations
         max_iter_reached = tf.less(i, counter_target)
-        # Check convergence by comparing current and previous sigxx/sigyy values
-        sigxx_converged = tf.less(tf.reduce_max(tf.abs(curr_sigxx - prev_sigxx)), convergence_threshold)
-        sigyy_converged = tf.less(tf.reduce_max(tf.abs(curr_sigyy - prev_sigyy)), convergence_threshold)
+
+        # More robust convergence check
+        sigxx_diff = tf.abs(curr_sigxx - prev_sigxx)
+        sigyy_diff = tf.abs(curr_sigyy - prev_sigyy)
+
+        # Check for NaN in current values
+        sigxx_valid = tf.logical_not(tf.reduce_any(tf.math.is_nan(curr_sigxx)))
+        sigyy_valid = tf.logical_not(tf.reduce_any(tf.math.is_nan(curr_sigyy)))
+        values_valid = tf.logical_and(sigxx_valid, sigyy_valid)
+
+        sigxx_converged = tf.less(tf.reduce_max(sigxx_diff), convergence_threshold)
+        sigyy_converged = tf.less(tf.reduce_max(sigyy_diff), convergence_threshold)
         converged = tf.logical_and(sigxx_converged, sigyy_converged)
-        # Don't check convergence on first iteration (prev values are initialization values)
         converged = tf.logical_and(converged, tf.logical_not(if_first_iter))
-        # Continue if: (not reached max iterations) AND (first iteration OR not converged)
-        return tf.logical_and(max_iter_reached, tf.logical_or(if_first_iter, tf.logical_not(converged)))
+
+        # Stop if NaN detected or converged
+        should_continue = tf.logical_and(max_iter_reached, values_valid)
+        should_continue = tf.logical_and(should_continue, tf.logical_or(if_first_iter, tf.logical_not(converged)))
+
+        return should_continue
 
     def body(i, alphax, alphay, alphaxy, mux, muy, prev_sigxx, prev_sigyy, curr_sigxx, curr_sigyy, back, e1, e2):
+        # Clamp alpha values to prevent extreme values
+        alphax = tf.clip_by_value(alphax, 0.5, 20.0)
+        alphay = tf.clip_by_value(alphay, 0.5, 20.0)
+        alphaxy = tf.clip_by_value(alphaxy, -10.0, 10.0)
+
         Xc = X - tf.reshape(mux, [-1, 1, 1])
         Yc = Y - tf.reshape(muy, [-1, 1, 1])
-        # Prevent numerical instability in arb_const calculation
-        alpha_ratio = alphaxy / (alphax * alphay + 1e-10)  # Prevent division by zero
-        alpha_ratio = tf.clip_by_value(alpha_ratio, -0.99, 0.99)
-        arb_const = 2.0 * (1.0 - alpha_ratio**2)
-        arb_const = tf.maximum(arb_const, 1e-10)  # Prevent division by zero
-        A = 1.0 / (2.0 * tf.constant(np.pi) * alphax * alphay * tf.sqrt(1.0 - alpha_ratio**2))
-        exp_term = (
-            (Xc**2) / (tf.reshape(arb_const * alphax**2, [-1, 1, 1])) +
-            (Yc**2) / (tf.reshape(arb_const * alphay**2, [-1, 1, 1])) -
-            2 * tf.reshape(alphaxy, [-1, 1, 1]) * Xc * Yc /
-            tf.reshape(arb_const * alphax**2 * alphay**2, [-1, 1, 1])
-        )
-        k = tf.reshape(A, [-1, 1, 1]) * tf.exp(-tf.clip_by_value(exp_term, 0.0, 50.0))
+
+        # More robust arb_const calculation
+        alpha_denom = tf.maximum(alphax * alphay, 1e-8)
+        alpha_ratio = tf.clip_by_value(alphaxy / alpha_denom, -0.95, 0.95)
+        arb_const = tf.maximum(2.0 * (1.0 - alpha_ratio**2), 1e-8)
+
+        # More robust A calculation
+        sqrt_term = tf.maximum(1.0 - alpha_ratio**2, 1e-8)
+        A = 1.0 / (2.0 * tf.constant(np.pi) * alpha_denom * tf.sqrt(sqrt_term))
+        A = tf.clip_by_value(A, 1e-10, 1e10)  # Prevent extreme values
+
+        # More robust exponential term
+        alphax_sq = tf.maximum(alphax**2, 1e-8)
+        alphay_sq = tf.maximum(alphay**2, 1e-8)
+
+        exp_term1 = (Xc**2) / tf.reshape(arb_const * alphax_sq, [-1, 1, 1])
+        exp_term2 = (Yc**2) / tf.reshape(arb_const * alphay_sq, [-1, 1, 1])
+        exp_term3 = 2 * tf.reshape(alphaxy, [-1, 1, 1]) * Xc * Yc / tf.reshape(arb_const * alphax_sq * alphay_sq, [-1, 1, 1])
+
+        exp_term = exp_term1 + exp_term2 - exp_term3
+        exp_term = tf.clip_by_value(exp_term, 0.0, 30.0)  # More conservative clipping
+
+        k = tf.reshape(A, [-1, 1, 1]) * tf.exp(-exp_term)
+        k = tf.where(tf.math.is_nan(k), 0.0, k)  # Replace NaN with 0
+        k = tf.where(tf.math.is_inf(k), 0.0, k)  # Replace Inf with 0
+
         img1 = images - tf.reshape(back, [-1, 1, 1])
+
+        # Compute moments with more robust denominators
         t1 = tf.reduce_sum(X * Y * img1 * k, axis=[1, 2])
         t2 = tf.reduce_sum(img1 * k, axis=[1, 2])
         t3 = tf.reduce_sum(X * img1 * k, axis=[1, 2])
         t4 = tf.reduce_sum(Y * img1 * k, axis=[1, 2])
         t5 = tf.reduce_sum(X * X * img1 * k, axis=[1, 2])
         t6 = tf.reduce_sum(Y * Y * img1 * k, axis=[1, 2])
+        t7 = tf.reduce_sum(k * k, axis=[1, 2])
 
-        # Adaptive background estimation
-        t7 = tf.reduce_sum(k * k, axis=[1, 2])          # Denominator
-        flux_calc = t2 / (t7 + 1e-10)                   # Flux under Gaussian PSF
-        total = tf.reduce_sum(images, axis=[1, 2])      # Total image flux
-        image_area = tf.cast(H * W, tf.float32)         # Constant
-        new_back = (total - flux_calc) / image_area     # Estimated background
-        # Prevent division by zero in moment calculations
-        t2_safe = tf.maximum(t2, 1e-10)
-        new_mux = t3 / t2_safe
-        new_muy = t4 / t2_safe
+        # Much more robust denominator handling
+        t2_safe = tf.maximum(tf.abs(t2), 1e-6)
+        t7_safe = tf.maximum(t7, 1e-6)
+
+        # Background estimation with bounds
+        flux_calc = t2 / t7_safe
+        total = tf.reduce_sum(images, axis=[1, 2])
+        image_area = tf.cast(H * W, tf.float32)
+        new_back = tf.clip_by_value((total - flux_calc) / image_area, -1.0, 1.0)
+
+        # Moment calculations with extensive safety checks
+        new_mux = tf.clip_by_value(t3 / t2_safe, -tf.cast(W, tf.float32)/2, tf.cast(W, tf.float32)/2)
+        new_muy = tf.clip_by_value(t4 / t2_safe, -tf.cast(H, tf.float32)/2, tf.cast(H, tf.float32)/2)
+
         sigxx = t5 / t2_safe - (t3 / t2_safe)**2
         sigyy = t6 / t2_safe - (t4 / t2_safe)**2
         sigxy = t1 / t2_safe - (t3 * t4) / (t2_safe * t2_safe)
-        #print (sigxx)
-        # Update alpha values with bounds checking
-        new_alphax = tf.sqrt(tf.clip_by_value(sigxx * 2.0, 0.81, 100.0))
-        new_alphay = tf.sqrt(tf.clip_by_value(sigyy * 2.0, 0.81, 100.0))
-        new_alphaxy = 2.0 * sigxy
-        #print (new_alphax)
-        # Compute ellipticities with numerical stability
-        denominator = sigxx + sigyy + 1e-10  # Prevent division by zero
-        new_e1 = (sigxx - sigyy) / denominator
-        new_e2 = 2.0 * sigxy / denominator
-        # Clip ellipticities to reasonable bounds
-        new_e1 = tf.clip_by_value(new_e1, -0.99, 0.99)
-        new_e2 = tf.clip_by_value(new_e2, -0.99, 0.99)
 
-        # Return as list to match loop_vars structure
-        # Move current sigxx/sigyy to prev for next iteration, update current with new values
+        # Clamp moment values to reasonable bounds
+        sigxx = tf.clip_by_value(sigxx, 0.25, 100.0)
+        sigyy = tf.clip_by_value(sigyy, 0.25, 100.0)
+        sigxy = tf.clip_by_value(sigxy, -50.0, 50.0)
+
+        # Update alphas with conservative bounds
+        new_alphax = tf.sqrt(tf.clip_by_value(sigxx * 2.0, 1.0, 400.0))
+        new_alphay = tf.sqrt(tf.clip_by_value(sigyy * 2.0, 1.0, 400.0))
+        new_alphaxy = tf.clip_by_value(2.0 * sigxy, -20.0, 20.0)
+
+        # Robust ellipticity calculation
+        denominator = tf.maximum(sigxx + sigyy, 1e-6)
+        new_e1 = tf.clip_by_value((sigxx - sigyy) / denominator, -0.95, 0.95)
+        new_e2 = tf.clip_by_value(2.0 * sigxy / denominator, -0.95, 0.95)
+
+        # Additional NaN checks
+        new_e1 = tf.where(tf.math.is_nan(new_e1), 0.0, new_e1)
+        new_e2 = tf.where(tf.math.is_nan(new_e2), 0.0, new_e2)
+        new_alphax = tf.where(tf.math.is_nan(new_alphax), 2.0, new_alphax)
+        new_alphay = tf.where(tf.math.is_nan(new_alphay), 2.0, new_alphay)
+        new_alphaxy = tf.where(tf.math.is_nan(new_alphaxy), 0.0, new_alphaxy)
+
         return [i + 1, new_alphax, new_alphay, new_alphaxy, new_mux, new_muy,
                 curr_sigxx, curr_sigyy, sigxx, sigyy, new_back, new_e1, new_e2]
 
@@ -221,23 +268,21 @@ def compute_ellipticity_batched_tf(images, counter_target=100, convergence_thres
     e1 = tf.zeros([B])
     e2 = tf.zeros([B])
 
-    # Run the iterative loop with proper convergence checking
-    # Use list structure for loop_vars to match body function return
+    # Run loop with reduced iterations for stability
     loop_result = tf.while_loop(
         cond,
         body,
         loop_vars=[i, alphax, alphay, alphaxy, mux, muy, prev_sigxx, prev_sigyy, curr_sigxx, curr_sigyy, back, e1, e2],
         maximum_iterations=counter_target,
-        parallel_iterations=1  # Ensure sequential execution for convergence
+        parallel_iterations=1
     )
 
-    # Extract e1 and e2 from the result
     e1 = loop_result[11]
     e2 = loop_result[12]
-    
-    e1 = tf.where(tf.math.is_nan(e1), 0.0, e1)
-    e2 = tf.where(tf.math.is_nan(e2), 0.0, e2)
 
+    # Final safety checks
+    e1 = tf.where(tf.logical_or(tf.math.is_nan(e1), tf.math.is_inf(e1)), 0.0, e1)
+    e2 = tf.where(tf.logical_or(tf.math.is_nan(e2), tf.math.is_inf(e2)), 0.0, e2)
 
     return e1, e2
 
@@ -364,12 +409,14 @@ class WeightedLossModel(Model):
             e1_pred, e2_pred = compute_ellipticity_batched_tf(sharp_pred)
             
             # Ellipticity loss (L2)
-            ellip_loss = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
-            ellip_weight = tf.constant(0.0, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)            #reblurred = blur_with_kernel(y_pred, kernel_img)
+            ellip_diff = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
+            ellip_loss = tf.reduce_mean(tf.clip_by_value(ellip_diff, 0.0, 1.0))  # Clip extreme values
+
+            ellip_weight = tf.constant(0.01, dtype=tf.float32) + tf.constant(0.05, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)            #reblurred = blur_with_kernel(y_pred, kernel_img)
             _, _, reblurred = normalize_all_by_blurred(blurred_img, y_pred, blur_with_kernel(y_pred, kernel_img))
             reblur_loss = tf.reduce_mean(tf.square(reblurred - blurred_img)* (weight_map))
 
-            total_loss = 100*weighted_mse + 10*reblur_loss 
+            total_loss = 100*weighted_mse + 10*reblur_loss + ellip_weight*ellip_loss
 
         grads = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
@@ -391,12 +438,14 @@ class WeightedLossModel(Model):
         e1_pred, e2_pred = compute_ellipticity_batched_tf(sharp_pred)
         
         # Ellipticity loss (L2)
-        ellip_loss = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
-        ellip_weight = tf.constant(0.0, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)        #reblurred = blur_with_kernel(y_pred, kernel_img)
+        ellip_diff = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
+        ellip_loss = tf.reduce_mean(tf.clip_by_value(ellip_diff, 0.0, 1.0))  # Clip extreme values
+
+        ellip_weight = tf.constant(0.01, dtype=tf.float32) + tf.constant(0.05, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)        #reblurred = blur_with_kernel(y_pred, kernel_img)
         _, _, reblurred = normalize_all_by_blurred(blurred_img, y_pred, blur_with_kernel(y_pred, kernel_img))
         reblur_loss = tf.reduce_mean(tf.square(reblurred - blurred_img)* (weight_map))
         
-        total_loss = 100*weighted_mse +  10*reblur_loss
+        total_loss = 100*weighted_mse +  10*reblur_loss + ellip_weight*ellip_loss
 
         self.compiled_metrics.update_state(y_true, y_pred)
         return {"loss": total_loss, "weighted_mse": weighted_mse, "ellipticity_loss": ellip_loss, "reblur_loss":reblur_loss}
@@ -424,7 +473,7 @@ history = model.fit(
     y=train_sharp,
     validation_data=([val_blur, val_ker, val_wt], val_sharp),
     epochs=10,
-    batch_size=256,
+    batch_size=128,
     verbose = 1,
     callbacks= [lr_scheduler, EpochTracker()]
 )
