@@ -25,7 +25,7 @@ def center_crop(img, crop=96):
     return img[:, start:start+crop, start:start+crop, :]
 
 # Load data
-data = np.load("/scratch/bell/dutta26/wiyn_sim/test_data.npz")
+data = np.load("/scratch/bell/dutta26/wiyn_sim/augment.npz")
 blurred = center_crop(data["blurred"])     # (N,96,96,1)
 kernel  = data["psf"]                      # (N,20,20,1)
 weights = center_crop(data["weight"])      # (N,96,96,1)

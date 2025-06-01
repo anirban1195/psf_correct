@@ -151,10 +151,6 @@ def center_crop(img, crop=96):
     return img[:, start:start+crop, start:start+crop, :]
 
 
-def center_crop(img, crop=96):
-    start = (img.shape[1] - crop) // 2
-    return img[:, start:start+crop, start:start+crop, :]
-
 # Example usage (assuming data loading works):
 data = np.load("/scratch/bell/dutta26/wiyn_sim/test_data_2k.npz")
 blurred = center_crop(data["blurred"])     # (N,96,96,1)

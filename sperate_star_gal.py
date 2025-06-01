@@ -15,8 +15,8 @@ import matplotlib.pyplot as plt
 phosimLoc = '/home/dutta26/Downloads/phosim_release/'
 sex_loc = '/home/dutta26/Downloads/sextractor-master/src/'
 filt = 'i'#str(sys.argv[1])
-idNo = 1020
-noImages = 6
+idNo = 1035
+noImages = 1
 
 for j in range(int(idNo), int(idNo)+noImages):
     
@@ -41,6 +41,9 @@ for j in range(int(idNo), int(idNo)+noImages):
     
     flux_arr = []
     size_arr= []
+    
+    x_arr = []
+    y_arr =[]
     #Measure the sources 
     for j in range(len(content)):
         temp = content[j].split()
@@ -51,7 +54,9 @@ for j in range(int(idNo), int(idNo)+noImages):
             continue
         x = int(float(temp[2]))
         y = int(float(temp[3]))
-        
+        x_arr.append(x)
+        y_arr.append(y)
+       
         cutout = img[y-50:y+50, x-50:x+50]
         flux, mux, muy, e1, e2, bkg, size, sigxx, sigyy, sigxy = helper.measure_new(cutout, [], [])
         
@@ -59,6 +64,7 @@ for j in range(int(idNo), int(idNo)+noImages):
             continue
         size_arr.append(size)
         flux_arr.append(flux)
+        
     
     
     
@@ -71,7 +77,9 @@ for j in range(int(idNo), int(idNo)+noImages):
     print (outLoc)
     
 
-    
+    #Convert x and y to np arrays
+    x_arr = np.array(x_arr)
+    y_arr = np.array(y_arr)
     
     
     #Make a numpy array if there exits a star limit file. Start = 1, glalaxy = 0
@@ -97,7 +105,9 @@ for j in range(int(idNo), int(idNo)+noImages):
     plt.savefig(outLoc+"/size_vs_counts.png")
     plt.close()
     store = np.zeros((tot_len, 8), dtype = np.float32)
+   
     count = 0 
+    star_count = 0
     #Measure the sources 
     for j in range(len(content)):
         temp = content[j].split()
@@ -119,10 +129,19 @@ for j in range(int(idNo), int(idNo)+noImages):
         
         star_bool = 0
         if size>size_low and size<size_high and flux>flux_low and flux<flux_high:
-            star_bool = 1
+            #Check if any source is blended or too close to the star ie withint +=50 pixles
+            dist = np.sqrt((x_arr-x)**2 + (y_arr-y)**2)
+            dist = np.sort(dist)
+            #print (dist[0:10])
+            if dist[1]>35:
+                star_bool = 1
+                star_count += 1
+
+            #temp = temp[temp[:,2].argsort()]
         
         store[count, 0:8 ] = x, y , sigxx, sigyy, sigxy , star_bool, ra , dec
         count += 1
+    print (count, star_count)
     
     store = store[0: count, :]
     np.save(outLoc+"/star_gal.npy", store)

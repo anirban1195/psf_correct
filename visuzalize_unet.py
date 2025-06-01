@@ -124,7 +124,7 @@ class WeightedLossModel(Model):
 
 # Load model with custom layers/functions
 model = load_model(
-    '/scratch/bell/dutta26/psf_datasets/unet_psf_model_bottleNeckFusion1.h5',
+    '/scratch/bell/dutta26/psf_datasets/unet_psf_model_bottleNeckFusion1_consistency.keras',
     custom_objects={
         'tile_and_crop_kernel': tile_and_crop_kernel,
         'WeightedLossModel': WeightedLossModel,
@@ -142,7 +142,7 @@ weights = center_crop(data["weight"])      # (N,96,96,1)
 sharp   = center_crop(data["sharp"])       # (N,96,96,1)
 
 # Select an index
-idx = 677  # change as needed
+idx = 4169  # change as needed
 
 # Prepare inputs
 blur_img   = blurred[idx:idx+1]

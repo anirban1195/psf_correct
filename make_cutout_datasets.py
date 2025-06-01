@@ -12,11 +12,12 @@ import helper_phosim, helper, os
 import subprocess,sys
 import matplotlib.pyplot as plt
 from astropy.stats import sigma_clipped_stats
+import tikho_deconv
 
 
 def makePSF(arr, blurred_img, n, large = 0 ):
     if(large == 0):
-        temp = np.zeros((20,20), dtype = np.float32)
+        temp = np.zeros((48,48), dtype = np.float32)
     else:
         temp = np.zeros((60,60), dtype = np.float32)
     tot = 0
@@ -25,7 +26,7 @@ def makePSF(arr, blurred_img, n, large = 0 ):
         dist = arr[j,2]
         tot += dist
         if(large == 0):
-            temp += dist*blurred_img[y-10:y+10, x-10:x+10]
+            temp += dist*blurred_img[y-24:y+24, x-24:x+24]
         else:
             temp += dist*blurred_img[y-30:y+30, x-30:x+30]
     return temp/tot 
@@ -35,6 +36,23 @@ def normalize (img):
     min_val = img.min()
     max_val = img.max()
     return (img)/(max_val - min_val)
+
+
+
+def normalize_all_by_blurred(blurred_img, sharp_img, tikho_img1, tikho_img2 ,eps=1e-6):
+    # Compute percentiles over the entire 2D image
+    vmin = np.min(blurred_img)#np.percentile(blurred_img, 0.05)
+    vmax = np.max(blurred_img)#np.percentile(blurred_img, 99.95)
+    scale = vmax - vmin + eps
+
+    # Normalize and clip
+    blurred_norm   = np.clip((blurred_img   - vmin) / scale, 0.0, 5.0)
+    sharp_norm     = np.clip((sharp_img     - vmin) / scale, 0.0, 5.0)
+    tikho_norm1 = np.clip((tikho_img1     - vmin) / scale, 0.0, 5.0)
+    tikho_norm2 = np.clip((tikho_img2     - vmin) / scale, 0.0, 5.0)
+    
+
+    return blurred_norm, sharp_norm, tikho_norm1, tikho_norm2
 
     
 def makeWt(mux_calc, muy_calc, alphax, alphay, alphaxy):
@@ -98,15 +116,16 @@ for j in range(int(idNo), int(idNo)+noImages):
     
     print (np.shape(star_arr))
     count = 0
-    blurred_arr = np.zeros((len(store), 100, 100), dtype= np.float32)
+    blurred_arr = np.zeros((len(store), 100, 100,3), dtype= np.float32)
     sharp_arr = np.zeros((len(store), 100, 100), dtype= np.float32)
-    psf_arr = np.zeros((len(store), 20, 20), dtype= np.float32)
+    psf_arr = np.zeros((len(store), 48, 48), dtype= np.float32)
     psf_arr_large = np.zeros((len(store), 60, 60), dtype= np.float32)
     wt_arr = np.zeros((len(store), 100, 100), dtype= np.float32)
     
     #Now loop over all sources 
     for j in range(len(store)):
         
+        #If a star i.e index 5= 1 or x and y is not defined i.e 0 then continue
         if(store[j,5] == 1 or store[j,0] == 0 or store[j,1] == 0):
             continue
         
@@ -136,11 +155,22 @@ for j in range(int(idNo), int(idNo)+noImages):
         
         
         #Put everything in arrays 
-        blurred_arr[count,:,:] = normalize(blurred_cut)
-        sharp_arr[count,:,:] = normalize(sharp_cut)
-        psf_arr[count,:,:] = normalize(psf)
-        psf_arr_large[count,:,:] = normalize(psf_large)
+        blurred_arr[count,:,:,0] = blurred_cut*2
+        sharp_arr[count,:,:] = sharp_cut
+        psf_arr[count,:,:] = psf/np.sum(psf)   #Normalize PSF to 1
+        psf_arr_large[count,:,:] = psf_large/np.sum(psf_large) ##Normalize PSF to 1
         wt_arr[count,:,:] = wt
+        
+        
+        #Deconvolve using tikho and add to array 
+        padded_psf = np.random.normal(0,1e-5, (100,100))
+        padded_psf[26:74, 26:74] += psf_arr[count,:,:]
+        padded_psf /= np.sum(padded_psf)
+        blurred_arr[count,:,:,1] = tikho_deconv.apply_tikhonov_deconv(blurred_arr[count:count+1,:,:,0], padded_psf, 0.1)[0,:,:]
+        blurred_arr[count,:,:,2] = tikho_deconv.apply_tikhonov_deconv(blurred_arr[count:count+1,:,:,0], padded_psf, 0.01)[0,:,:]
+        
+        #Normalize the blurred, sharp, tikho1 and tikho2
+        blurred_arr[count,:,:,0],sharp_arr[count,:,:],blurred_arr[count,:,:,1],blurred_arr[count,:,:,2] = normalize_all_by_blurred(blurred_arr[count,:,:,0],sharp_arr[count,:,:],blurred_arr[count,:,:,1],blurred_arr[count,:,:,2])
     
         count += 1
     print (count)
