@@ -41,8 +41,8 @@ def normalize (img):
 
 def normalize_all_by_blurred(blurred_img, sharp_img, tikho_img1, tikho_img2 ,eps=1e-6):
     # Compute percentiles over the entire 2D image
-    vmin = np.min(blurred_img)#np.percentile(blurred_img, 0.05)
-    vmax = np.max(blurred_img)#np.percentile(blurred_img, 99.95)
+    vmin = min(np.percentile(blurred_img, 0.01), np.percentile(tikho_img1, 0.01), np.percentile(tikho_img2, 0.01))
+    vmax = max(np.percentile(blurred_img, 99.99),np.percentile(tikho_img1, 99.99), np.percentile(tikho_img2, 99.99)) 
     scale = vmax - vmin + eps
 
     # Normalize and clip
