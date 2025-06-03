@@ -56,17 +56,23 @@ weights = center_crop(weights, crop=96)     # (N, 96, 96, 1)
 sharp   = center_crop(sharp, crop=96)       # (N, 96, 96, 1)
 # kernel remains (N, 48, 48, 1)
 
-print("\nAfter cropping:")
-print(f"blurred: {blurred.shape}")
-print(f"kernel: {kernel.shape}")
-print(f"weights: {weights.shape}")
-print(f"sharp: {sharp.shape}")
 
-# Verify the channels are correct
-print("\nChannel verification:")
-print(f"blurred channel 0 range: [{blurred[:,:,:,0].min():.4f}, {blurred[:,:,:,0].max():.4f}]")
-print(f"blurred channel 1 range: [{blurred[:,:,:,1].min():.4f}, {blurred[:,:,:,1].max():.4f}]")
-print(f"blurred channel 2 range: [{blurred[:,:,:,2].min():.4f}, {blurred[:,:,:,2].max():.4f}]")
+# =============================================================================
+# #Check dimension 1
+# print("\nAfter cropping:")
+# print(f"blurred: {blurred.shape}")
+# print(f"kernel: {kernel.shape}")
+# print(f"weights: {weights.shape}")
+# print(f"sharp: {sharp.shape}")
+# =============================================================================
+
+# =============================================================================
+# # Verify the channels are correct. Check dim 2
+# print("\nChannel verification:")
+# print(f"blurred channel 0 range: [{blurred[:,:,:,0].min():.4f}, {blurred[:,:,:,0].max():.4f}]")
+# print(f"blurred channel 1 range: [{blurred[:,:,:,1].min():.4f}, {blurred[:,:,:,1].max():.4f}]")
+# print(f"blurred channel 2 range: [{blurred[:,:,:,2].min():.4f}, {blurred[:,:,:,2].max():.4f}]")
+# =============================================================================
 
 # --- Train/Validation Split ---
 (train_blur, val_blur,
@@ -77,17 +83,30 @@ print(f"blurred channel 2 range: [{blurred[:,:,:,2].min():.4f}, {blurred[:,:,:,2
     test_size=0.2, random_state=42
 )
 
-print("\nTraining data shapes:")
-print(f"train_blur: {train_blur.shape}, val_blur: {val_blur.shape}")
-print(f"train_ker: {train_ker.shape}, val_ker: {val_ker.shape}")
-print(f"train_wt: {train_wt.shape}, val_wt: {val_wt.shape}")
-print(f"train_sharp: {train_sharp.shape}, val_sharp: {val_sharp.shape}")
+# =============================================================================
+# #Chek dim 3
+# print("\nTraining data shapes:")
+# print(f"train_blur: {train_blur.shape}, val_blur: {val_blur.shape}")
+# print(f"train_ker: {train_ker.shape}, val_ker: {val_ker.shape}")
+# print(f"train_wt: {train_wt.shape}, val_wt: {val_wt.shape}")
+# print(f"train_sharp: {train_sharp.shape}, val_sharp: {val_sharp.shape}")
+# =============================================================================
 
 # --- Utility Functions (keeping your existing ones) ---
 @register_keras_serializable()
 def compute_ellipticity_batched_tf(images, counter_target=40, convergence_threshold=1e-2):
     """
-    Your existing ellipticity computation function
+    Compute e1, e2 ellipticities from a batch of images using iterative moment matching with adaptive Gaussian weighting.
+    Args:
+        images: Tensor of shape [B, H, W], batch of images.
+        counter_target: Maximum number of iterations (default: 100)
+        convergence_threshold: Threshold for convergence check (default: 1e-6)
+    Returns:
+        e1: Tensor of shape [B], ellipticity component 1
+        e2: Tensor of shape [B], ellipticity component 2
+    """
+    """
+    Robust version with extensive NaN prevention
     """
     # [Keep your existing implementation]
     B, H, W = tf.unstack(tf.shape(images))
@@ -233,6 +252,10 @@ def compute_ellipticity_batched_tf(images, counter_target=40, convergence_thresh
 def blur_with_kernel(image, kernel):
     """
     Convolve predicted sharp image with PSF kernel for each sample in the batch.
+    image:  (B, H, W, 1)
+    kernel: (B, kH, kW, 1)
+    Returns:
+    blurred image of shape (B, H, W, 1)
     """
     def single_convolve(inputs):
         img, ker = inputs
@@ -370,7 +393,7 @@ class WeightedLossModel(Model):
 
             ellip_diff = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
             ellip_loss = tf.reduce_mean(tf.clip_by_value(ellip_diff, 0.0, 1.0))
-            ellip_weight = tf.constant(0.01, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)
+            ellip_weight = tf.constant(0.01, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 4), tf.float32)
 
             # FIXED: Now correctly extracting channel 0
             original_blurred = blurred_img[:,:,:,0:1]  # Shape: (B, 96, 96, 1)
@@ -407,7 +430,7 @@ class WeightedLossModel(Model):
 
         ellip_diff = tf.reduce_mean((e1_true - e1_pred)**2 + (e2_true - e2_pred)**2)
         ellip_loss = tf.reduce_mean(tf.clip_by_value(ellip_diff, 0.0, 1.0))
-        ellip_weight = tf.constant(0.01, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 9), tf.float32)
+        ellip_weight = tf.constant(0.01, dtype=tf.float32) + tf.constant(0.1, dtype=tf.float32) * tf.cast(tf.minimum(self.current_epoch, 4), tf.float32)
 
         original_blurred = blurred_img[:,:,:,0:1]
         reblurred = blur_with_kernel(y_pred, kernel_img)
@@ -455,7 +478,7 @@ history = model.fit(
     x=[train_blur, train_ker, train_wt],
     y=train_sharp,
     validation_data=([val_blur, val_ker, val_wt], val_sharp),
-    epochs=10,
+    epochs=7,
     batch_size=128,
     verbose=1,
     callbacks=[lr_scheduler, EpochTracker()]
