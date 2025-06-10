@@ -137,6 +137,15 @@ for j in range(int(idNo), int(idNo)+noImages):
         blurred_cut = blurred_img[int(y_b)-50: int(y_b)+50, int(x_b)-50: int(x_b)+50]
         sharp_cut = sharp_img[int(y_s)-50: int(y_s)+50, int(x_s)-50: int(x_s)+50]
         
+        #Sharp cut is not always centered due to systematics. Hence recenter it 
+        flux, mux, muy, e1, e2, bkg, size, sigxx, sigyy, sigxy = helper.measure_new(sharp_cut, [], [])
+        if (flux == None or mux == None or muy == None ):
+            continue
+        y_s += muy
+        x_s += mux
+        sharp_cut = sharp_img[int(y_s)-50: int(y_s)+50, int(x_s)-50: int(x_s)+50]
+
+        
         if 0.0 in blurred_cut or 0.0 in sharp_cut:
             continue
         
